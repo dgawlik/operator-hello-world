@@ -1,0 +1,12 @@
+apiVersion: com.github.webserving/v1alpha1
+kind: WebServingResource
+metadata:
+  name: example-ws
+  namespace: default
+spec:
+  page1: |
+    <h1>Hola amigos!</h1>
+    <p>Buenos dias!</p>
+  page2: |
+    <h1>Tchuss freunden!</h1>
+    <p>Guten abend!</p>
