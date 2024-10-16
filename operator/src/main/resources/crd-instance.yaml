@@ -8,5 +8,5 @@ spec:
     <h1>Hola amigos!</h1>
     <p>Buenos dias!</p>
   page2: |
-    <h1>Tchuss freunden!</h1>
-    <p>Guten abend!</p>
+    <h1>Hello my friend</h1>
+    <p>Good evening</p>

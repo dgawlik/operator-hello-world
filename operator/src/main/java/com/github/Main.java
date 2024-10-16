@@ -8,6 +8,7 @@ import io.fabric8.kubernetes.client.KubernetesClient;
 import io.fabric8.kubernetes.client.KubernetesClientBuilder;
 
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -17,10 +18,6 @@ public class Main {
     private static ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
     private static Object changes = new Object();
     private static WebServingResource currentCrd;
-    private static WebServingResource previousCrd;
-    private static Deployment currentServingDeployment;
-    private static Service currentServingService;
-    private static ConfigMap currentConfigMap;
 
     public static void main(String[] args) throws InterruptedException {
 
@@ -28,73 +25,78 @@ public class Main {
 
         var crdClient = client.resources(WebServingResource.class).inNamespace("default");
 
-        var crd = crdClient.list().getItems();
 
-        if (crd.isEmpty()) {
-            currentCrd = null;
-        } else {
-            currentCrd = crd.get(0);
-        }
-
-        currentServingDeployment = client.apps().deployments().inNamespace("default")
-                .withName("web-serving-app-deployment").get();
-
-        currentServingService = client.services().inNamespace("default")
-                .withName("web-serving-app-svc").get();
-
-        currentConfigMap = client.configMaps().inNamespace("default")
-                .withName("web-serving-app-config").get();
-
-
-        crdClient.inform(new GenericResourceEventHandler<>(client, update -> {
+        var handler = new GenericResourceEventHandler<>(update -> {
             synchronized (changes) {
-                previousCrd = currentCrd;
-                currentCrd = update;
                 changes.notifyAll();
             }
-        })).start();
+        });
 
-        client.apps().deployments().inNamespace("default").withName("web-serving-app-deployment").inform(new GenericResourceEventHandler<>(client, update -> {
-            synchronized (changes) {
-                currentServingDeployment = update;
-                changes.notifyAll();
-            }
-        })).start();
+        crdClient.inform(handler).start();
 
-        client.services().inNamespace("default").withName("web-serving-app-svc").inform(new GenericResourceEventHandler<>(client, update -> {
-            synchronized (changes) {
-                currentServingService = update;
-                changes.notifyAll();
-            }
-        })).start();
+        client.apps().deployments().inNamespace("default")
+                .withName("web-serving-app-deployment").inform(handler).start();
 
-        client.configMaps().inNamespace("default").withName("web-serving-app-config").inform(new GenericResourceEventHandler<>(client, update -> {
-            synchronized (changes) {
-                currentConfigMap = update;
-                changes.notifyAll();
-            }
-        })).start();
+        client.services().inNamespace("default")
+                .withName("web-serving-app-svc").inform(handler).start();
+
+        client.configMaps().inNamespace("default")
+                .withName("web-serving-app-config").inform(handler).start();
 
 
         for (; ; ) {
-            if (currentCrd == null) {
+
+            var crdList = crdClient.list().getItems();
+            var crd = Optional.ofNullable(crdList.isEmpty() ? null : crdList.get(0));
+
+
+            var skipUpdate = false;
+            var reload = false;
+
+            if (!crd.isPresent()) {
                 System.out.println("No WebServingResource found, reconciling disabled");
-            } else {
-                if (!currentCrd.equals(previousCrd)
-                        || currentConfigMap == null ||
-                        !desiredConfigMap(currentCrd).equals(currentConfigMap)) {
-                    System.out.println("Reconciling ConfigMap");
-                    client.configMaps().withName("web-serving-app-config")
-                            .createOrReplace(desiredConfigMap(currentCrd));
-                }
+                currentCrd = null;
+                skipUpdate = true;
+            } else if (!crd.get().getSpec().equals(
+                    Optional.ofNullable(currentCrd)
+                            .map(WebServingResource::getSpec).orElse(null))) {
+                currentCrd = crd.orElse(null);
+                System.out.println("Crd changed, Reconciling ConfigMap");
+                reload = true;
+            }
 
-                if (currentConfigMap == null) {
-                    System.out.println("No ConfigMap found, no point in reconciling web app for now");
-                } else {
-                    System.out.println("Reconciling WebServingResource");
-                    reconcileServingApp(client, currentCrd, !currentCrd.equals(previousCrd));
-                }
+            var currentConfigMap = client.configMaps().inNamespace("default")
+                    .withName("web-serving-app-config").get();
 
+            if(!skipUpdate && (reload || desiredConfigMap(currentCrd).equals(currentConfigMap))) {
+                System.out.println("New configmap, reconciling WebServingResource");
+                client.configMaps().inNamespace("default").withName("web-serving-app-config")
+                        .createOrReplace(desiredConfigMap(currentCrd));
+                reload = true;
+            }
+
+            var currentServingDeploymentNullable = client.apps().deployments().inNamespace("default")
+                    .withName("web-serving-app-deployment").get();
+            var currentServingDeployment = Optional.ofNullable(currentServingDeploymentNullable);
+
+            if(!skipUpdate && (reload || !desiredWebServingDeployment(currentCrd).getSpec().equals(
+                    currentServingDeployment.map(Deployment::getSpec).orElse(null)))) {
+
+                System.out.println("Reconciling Deployment");
+                client.apps().deployments().inNamespace("default").withName("web-serving-app-deployment")
+                        .createOrReplace(desiredWebServingDeployment(currentCrd));
+            }
+
+            var currentServingServiceNullable = client.services().inNamespace("default")
+                        .withName("web-serving-app-svc").get();
+            var currentServingService = Optional.ofNullable(currentServingServiceNullable);
+
+            if(!skipUpdate && (reload || !desiredWebServingService(currentCrd).getSpec().equals(
+                    currentServingService.map(Service::getSpec).orElse(null)))) {
+
+                System.out.println("Reconciling Service");
+                client.services().inNamespace("default").withName("web-serving-app-svc")
+                        .createOrReplace(desiredWebServingService(currentCrd));
             }
 
             synchronized (changes) {
@@ -102,39 +104,6 @@ public class Main {
             }
         }
 
-    }
-
-    private static void reconcileServingApp(KubernetesClient client, WebServingResource crd, boolean forceUpdate) {
-
-        if (forceUpdate){
-            client.apps().deployments().inNamespace("default").withName("web-serving-app-deployment")
-                    .createOrReplace(desiredWebServingDeployment(crd));
-            client.services().inNamespace("default").withName("web-serving-app-svc")
-                    .createOrReplace(desiredWebServingService(crd));
-            return;
-        }
-
-        if (currentServingDeployment == null) {
-            client.apps().deployments().inNamespace("default").withName("web-serving-app-deployment")
-                    .create(desiredWebServingDeployment(crd));
-        } else {
-
-            if (desiredWebServingDeployment(crd).getSpec().equals(currentServingDeployment.getSpec())
-            ) {
-                client.apps().deployments().inNamespace("default").withName("web-serving-app-pod").edit(d -> desiredWebServingDeployment(crd));
-            }
-        }
-
-        if (currentServingService == null) {
-            client.services().inNamespace("default").withName("web-serving-app-svc")
-                    .create(desiredWebServingService(crd));
-        } else {
-
-            if (desiredWebServingService(crd).getSpec().equals(currentServingService.getSpec())
-            ) {
-                client.services().inNamespace("default").withName("web-serving-app-svc").edit(p -> desiredWebServingService(crd));
-            }
-        }
     }
 
 
